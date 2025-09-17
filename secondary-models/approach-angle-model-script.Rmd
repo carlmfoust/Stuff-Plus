@@ -1,0 +1,261 @@
+---
+title: "MLB_AA_Modeling"
+output: html_document
+date: "2025-04-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls()) 
+
+# Data Manipulation
+library(tidyverse)
+
+# Modeling
+library(tidymodels)
+library(xgboost)
+library(vip)
+library(doParallel)
+
+# SQL
+library(RMySQL)
+
+wd <- getwd()
+set.seed(1015)
+```
+
+```{r}
+con <- dbConnect(MySQL(),
+                 user="root",
+                 host="localhost",
+                 db = "baseball-research")
+
+training_sql <- "SELECT * FROM statcast_pitching WHERE game_year >= 2021 AND game_year < 2025 AND game_type = 'R'"
+
+testing_sql <- "SELECT * FROM statcast_pitching WHERE game_year >= 2025 AND game_type = 'R'"
+
+data_train <- dbGetQuery(con, training_sql)
+data_test <- dbGetQuery(con, testing_sql) |> filter(game_year > 2024)
+
+```
+
+# Features
+- Velo
+- Release Height
+- Release Side
+- IVB
+- HB
+- Plate Loc Height
+- Plate Loc Side
+
+```{r}
+
+pitching_pbp <- data_train |> 
+  select(player_name, pitcher, pitch_name, at_bat_number, pitch_number, plate_x, plate_z, release_speed, release_pos_x, 
+         release_pos_z, pfx_x, pfx_z, p_throws, game_year, game_date,
+         vx0, vy0, vz0, ax, ay, az, arm_angle) |> 
+  na.omit()
+
+pitching_processed = pitching_pbp |> 
+  mutate(vy_f = -sqrt((vy0^2 - (2 * ay * (50 - (17/12))))),
+         t = (vy_f - vy0) / ay,
+         vz_f = vz0 + (az * t),
+         vx_f = vx0 + (ax * t),
+         VAA = -atan((vz_f / vy_f)) * (180 / pi),
+         HAA = -atan((vx_f / vy_f)) * (180 / pi)) %>%
+  mutate(
+    # Velocity magnitude
+    v_mag = sqrt(vx0^2 + vy0^2 + vz0^2),
+    
+    # Tangential unit vector
+    tang_x = vx0 / v_mag,
+    tang_y = vy0 / v_mag,
+    tang_z = vz0 / v_mag,
+
+    # Temporary axis aligned with arm angle or vertical
+    handedness_factor = if_else(p_throws == "R", 1, -1),
+    temp_x = 0,
+    temp_y = 0,
+    temp_z = 1,
+
+    # Horizontal vector = cross(temp, tang)
+    horz_x_raw = temp_y * tang_z - temp_z * tang_y,
+    horz_y_raw = temp_z * tang_x - temp_x * tang_z,
+    horz_z_raw = temp_x * tang_y - temp_y * tang_x,
+    horz_mag = sqrt(horz_x_raw^2 + horz_y_raw^2 + horz_z_raw^2),
+    horz_x = horz_x_raw / horz_mag,
+    horz_y = horz_y_raw / horz_mag,
+    horz_z = horz_z_raw / horz_mag,
+
+    # Vertical vector = cross(tang, horz)
+    vert_x = tang_y * horz_z - tang_z * horz_y,
+    vert_y = tang_z * horz_x - tang_x * horz_z,
+    vert_z = tang_x * horz_y - tang_y * horz_x,
+
+    # Projections
+    a_tang = ax * tang_x + ay * tang_y + az * tang_z,
+    a_horz = ax * horz_x + ay * horz_y + az * horz_z,
+    a_vert = ax * vert_x + ay * vert_y + az * vert_z
+    ) |> 
+  mutate(pfx_x = pfx_x * 12,
+         pfx_z = pfx_z * 12,
+         pfx_x = ifelse(p_throws == "R", pfx_x, pfx_x*-1)) |>
+  select(player_name:game_date, arm_angle, VAA, HAA, a_horz, a_vert)
+
+```
+
+```{r}
+pitching_processed <- pitching_processed |>
+  filter(
+    !pitch_name %in% c("Eephus", "Other", "Knuckleball"),
+    release_speed > 60,
+    !(pitch_name %in% c("4-Seam Fastball", "Sinker") & release_speed <= 80)
+  )
+```
+
+```{r}
+model_data_VAA <- pitching_processed |> 
+  rename(Label = VAA) |> 
+  select(release_speed, release_pos_x, release_pos_z, a_horz, a_vert, plate_x, plate_z, Label)
+```
+
+```{r}
+set.seed(1015)
+
+data_split = initial_validation_split(model_data_VAA, prop = c(0.8, 0.1), strata = Label)
+train = training(data_split)
+test = testing(data_split)
+val_set = validation_set(data_split)
+val = validation(data_split)
+
+spec = boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), sample_size = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("xgboost", nthread = 16)
+
+rec = recipe(Label ~ ., data = train)
+
+wf = workflow() %>%
+  add_model(spec) %>%
+  add_recipe(rec)
+
+registerDoParallel(makeCluster(8))
+
+print(paste0("Starting Tuning: ", Sys.time()))
+
+tune_res = wf %>%
+  tune_bayes(resamples = val_set,
+             initial = 20,
+             iter = 100,
+             control = control_bayes(verbose = TRUE, no_improve = 5, seed = 1015),
+             metrics = metric_set(rmse))
+
+best_params = select_best(tune_res, metric = "rmse")
+
+print(paste0("Starting Fitting: ", Sys.time()))
+
+final_model = wf %>%
+  finalize_workflow(best_params) %>%
+  fit(data = train)
+
+print(paste0("Ended Fitting: ", Sys.time()))
+
+saveRDS(final_model, paste0(wd, "/models/VAA", ".rds"))
+
+preds = predict(final_model, test) %>%
+  bind_cols(test)
+
+preds_rmse <- rmse(preds, Label, .pred)
+
+write.csv(auc_res, 
+          paste0(wd, 
+                 "/models/", pHand, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), 
+                 "_Error.csv"), 
+          row.names = FALSE)
+
+vip_plot = final_model %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 40) +
+  ggtitle(paste0("Feature Importance"))
+
+ggsave(filename = paste0(wd, 
+                         "/models/", pHand, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), 
+                         "_VIP.png"), 
+       plot = vip_plot, 
+       width = 10, 
+       height = 8, 
+       dpi = 300)
+```
+
+```{r}
+model_data_HAA <- pitching_processed |> 
+  rename(Label = HAA) |> 
+  select(release_speed, release_pos_x, release_pos_z, a_horz, a_vert, plate_x, plate_z, Label)
+```
+
+```{r}
+set.seed(1015)
+
+data_split = initial_validation_split(model_data_HAA, prop = c(0.8, 0.1), strata = Label)
+train = training(data_split)
+test = testing(data_split)
+val_set = validation_set(data_split)
+val = validation(data_split)
+
+spec = boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), sample_size = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("xgboost", nthread = 16)
+
+rec = recipe(Label ~ ., data = train)
+
+wf = workflow() %>%
+  add_model(spec) %>%
+  add_recipe(rec)
+
+registerDoParallel(makeCluster(8))
+
+print(paste0("Starting Tuning: ", Sys.time()))
+
+tune_res = wf %>%
+  tune_bayes(resamples = val_set,
+             initial = 20,
+             iter = 100,
+             control = control_bayes(verbose = TRUE, no_improve = 5, seed = 1015),
+             metrics = metric_set(rmse))
+
+best_params = select_best(tune_res, metric = "rmse")
+
+print(paste0("Starting Fitting: ", Sys.time()))
+
+final_model = wf %>%
+  finalize_workflow(best_params) %>%
+  fit(data = train)
+
+print(paste0("Ended Fitting: ", Sys.time()))
+
+saveRDS(final_model, paste0(wd, "/models/HAA", ".rds"))
+
+preds = predict(final_model, test) %>%
+  bind_cols(test)
+
+preds_rmse <- rmse(preds, Label, .pred)
+
+# write.csv(auc_res, 
+#           paste0(wd, 
+#                  "/models/", pHand, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), 
+#                  "_Error.csv"), 
+#           row.names = FALSE)
+
+vip_plot = final_model %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 40) +
+  ggtitle(paste0("Feature Importance"))
+
+# ggsave(filename = paste0(wd, 
+#                          "/models/", pHand, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), 
+#                          "_VIP.png"), 
+       # plot = vip_plot, 
+       # width = 10, 
+       # height = 8, 
+       # dpi = 300)
+```
+
