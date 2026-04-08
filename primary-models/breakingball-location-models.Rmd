@@ -50,7 +50,7 @@ data_test <- dbGetQuery(con, testing_sql) |> filter(game_year > 2024)
 
 pitching_pbp <- data_train |>
   select(player_name, pitcher, pitch_name, at_bat_number,
-         pitch_number, description, launch_speed_angle, plate_x, plate_z,
+         pitch_number, description, launch_speed_angle, plate_x, plate_z, sz_top, sz_bot,
          release_speed, release_spin_rate, release_extension, spin_axis, release_pos_x, release_pos_z, pfx_x, pfx_z,
          p_throws, stand, game_year, game_date, vx0,
          vy0, vz0, ax, ay, az, arm_angle) |>
@@ -90,6 +90,12 @@ pitching_processed <- pitching_processed |>
   mutate(pfx_x = pfx_x * 12,
          pfx_z = pfx_z * 12,
          stand = as.numeric(factor(stand)) - 1,
+         sz_top = sz_top * 12,
+         sz_bot = sz_bot * 12,
+         sz_height = (sz_top - sz_bot),
+         sz_mid = (sz_height / 2) + sz_bot,
+         sz_mid_z_diff = (plate_z * 12) - sz_mid,
+         dist_from_mid = ((sz_mid_z_diff)^2 + (plate_x * 12)^2)^(1 / 2),
          plate_x_og = plate_x,
          plate_z_og = plate_z,
          plate_x = 0,
@@ -192,6 +198,7 @@ vprocessedData = pitching_processed |>
 modelData = vprocessedData |>
   select(player_name, game_date, pitch_name,
          plate_x_og, plate_z_og,
+         sz_top, sz_bot, dist_from_mid,
          stand, p_throws,
          Swing, Whiff, Foul, BIP, CalledStrike, HBP)
 
