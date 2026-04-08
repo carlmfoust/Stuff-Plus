@@ -1,0 +1,346 @@
+---
+title: "MLB Quality Plus - Off-Speed"
+author: "Carl Foust"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+
+# Data Manipulation
+library(tidyverse)
+
+# Modeling
+library(tidymodels)
+library(xgboost)
+library(vip)
+library(doParallel)
+
+# SQL
+library(RMySQL)
+
+wd <- getwd()
+set.seed(1015)
+```
+
+```{r}
+.VAA_Model = readRDS(paste0("C:/Users/Mason/Desktop/Code/Baseball-Research/Stuff-Plus/2.0/models/VAA.rds"))
+
+.HAA_Model = readRDS(paste0("C:/Users/Mason/Desktop/Code/Baseball-Research/Stuff-Plus/2.0/models/HAA.rds"))
+```
+
+```{r}
+con <- dbConnect(MySQL(),
+                 user="root",
+                 host="localhost",
+                 db = "baseball-research")
+
+training_sql <- "SELECT * FROM statcast_pitching WHERE game_year >= 2021 AND game_year < 2025 AND game_type = 'R'"
+
+testing_sql <- "SELECT * FROM statcast_pitching WHERE game_year >= 2025 AND game_type = 'R'"
+
+data_train <- dbGetQuery(con, training_sql)
+data_test <- dbGetQuery(con, testing_sql) |> filter(game_year > 2024)
+
+```
+
+```{r}
+
+pitching_pbp <- data_train |>
+  select(player_name, pitcher, pitch_name, at_bat_number,
+         pitch_number, description, launch_speed_angle, plate_x, plate_z,
+         release_speed, release_spin_rate, release_extension, spin_axis, release_pos_x, release_pos_z, pfx_x, pfx_z,
+         p_throws, stand, game_year, game_date, vx0,
+         vy0, vz0, ax, ay, az, arm_angle) |>
+  drop_na(!launch_speed_angle)
+
+pitching_processed <- pitching_pbp |>
+  mutate(vy_f = -sqrt((vy0^2 - (2 * ay * (50 - (17/12))))),
+         t = (vy_f - vy0) / ay,
+         vz_f = vz0 + (az * t),
+         vx_f = vx0 + (ax * t),
+         VAA = -atan((vz_f / vy_f)) * (180 / pi),
+         HAA = -atan((vx_f / vy_f)) * (180 / pi),
+         v_mag = sqrt(vx0^2 + vy0^2 + vz0^2),
+         tang_x = vx0 / v_mag,
+         tang_y = vy0 / v_mag,
+         tang_z = vz0 / v_mag,
+         handedness_factor = if_else(p_throws == "R", 1, -1),
+         temp_x = 0,
+         temp_y = 0,
+         temp_z = 1,
+         horz_x_raw = temp_y * tang_z - temp_z * tang_y,
+         horz_y_raw = temp_z * tang_x - temp_x * tang_z,
+         horz_z_raw = temp_x * tang_y - temp_y * tang_x,
+         horz_mag = sqrt(horz_x_raw^2 + horz_y_raw^2 + horz_z_raw^2),
+         horz_x = horz_x_raw / horz_mag,
+         horz_y = horz_y_raw / horz_mag,
+         horz_z = horz_z_raw / horz_mag,
+         vert_x = tang_y * horz_z - tang_z * horz_y,
+         vert_y = tang_z * horz_x - tang_x * horz_z,
+         vert_z = tang_x * horz_y - tang_y * horz_x,
+         a_tang = ax * tang_x + ay * tang_y + az * tang_z,
+         a_horz = ax * horz_x + ay * horz_y + az * horz_z,
+         a_vert = ax * vert_x + ay * vert_y + az * vert_z) |>
+  select(-c(vx0:az, vy_f:vx_f, v_mag:a_tang))
+
+pitching_processed <- pitching_processed |>
+  mutate(pfx_x = pfx_x * 12,
+         pfx_z = pfx_z * 12,
+         stand = as.numeric(factor(stand)) - 1,
+         plate_x_og = plate_x,
+         plate_z_og = plate_z,
+         plate_x = 0,
+         plate_z = 2.5)
+
+pitching_processed <- pitching_processed |>
+  mutate(PitchGroup = case_when(pitch_name %in% c("4-Seam Fastball", "Sinker", "Cutter") ~ "Fastball",
+                                pitch_name %in% c("Slider", "Sweeper", "Curveball", "Slurve",
+                                                  "Knuckle Curve", "Slow Curve", "Screwball") ~ "BreakingBall",
+                                pitch_name %in% c("Changeup", "Split-Finger", "Forkball") ~ "Offspeed",
+                                pitch_name %in% c("Eephus", "Knuckleball", "Other") ~ "Other",
+                                TRUE ~ NA))
+
+VAA_preds = predict(.VAA_Model, pitching_processed) |> rename(xVAA = .pred)
+
+HAA_preds = predict(.HAA_Model, pitching_processed) |> rename(xHAA = .pred)
+
+pitching_processed = bind_cols(pitching_processed, VAA_preds, HAA_preds) |>
+  select(player_name:pitch_name, PitchGroup, at_bat_number:stand, arm_angle:VAA, xVAA, HAA, xHAA, a_horz:plate_z_og, game_date, game_year)
+```
+
+```{r}
+
+FB_avg <- pitching_processed |>
+  filter(pitch_name %in% c("4-Seam Fastball", "Sinker")) |>
+  group_by(player_name, pitcher) |>
+  summarise(
+    n = n(),
+    FBvelo = mean(release_speed, na.rm = TRUE),
+    FBvbreak = mean(pfx_z, na.rm = TRUE),
+    FBhbreak = mean(pfx_x, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 2: Cutter data
+Cutter_data <- pitching_processed |>
+  filter(pitch_name == "Cutter") |>
+  group_by(player_name, pitcher) |>
+  summarise(
+    n = n(),
+    CTvelo = mean(release_speed, na.rm = TRUE),
+    CTvert = mean(pfx_z, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 3: Join and Compare
+Cutter_labeled <- Cutter_data |>
+  left_join(FB_avg, by = c("player_name", "pitcher")) |>
+  mutate(
+    VeloRatio = CTvelo / FBvelo,
+    pitch_name = "Cutter",
+    new_group = case_when(
+      is.na(FBvelo) & CTvert > 5 ~ "Fastball",
+      is.na(FBvelo) ~ "BreakingBall",
+      VeloRatio >= 0.95 ~ "Fastball",
+      CTvert <= 5 ~ "BreakingBall",
+      VeloRatio <= 0.935 ~ "BreakingBall",
+      TRUE ~ "Fastball"
+    )
+  ) |> select(player_name, pitcher, pitch_name, new_group)
+
+# Step 4: Combine with rest of data
+pitching_processed <- pitching_processed |>
+  left_join(Cutter_labeled, by = c("player_name", "pitcher", "pitch_name")) |>
+  mutate(PitchGroup = if_else(pitch_name == "Cutter", new_group, PitchGroup)) |>
+  select(-new_group)
+
+pitching_processed <- pitching_processed |>
+  left_join(FB_avg |> select(-c(n)), by = c('player_name', 'pitcher')) |>
+  mutate(RelSpeedDiff = release_speed - FBvelo,
+         Horz_Accel_Diff = a_horz - FBhbreak,
+         Vert_Accel_Diff = a_vert - FBvbreak,
+         launch_speed_angle = ifelse(is.na(launch_speed_angle), 0, launch_speed_angle)) |>
+  na.omit()
+
+```
+
+```{r}
+
+Swing = c('hit_into_play', 'foul','foul_tip', 'swinging_strike', 'swinging_strike_blocked',
+          'foul_bunt', 'missed_bunt', 'bunt_foul_tip')
+Whiff = c('swinging_strike', 'swinging_strike_blocked', 'foul_tip', 'bunt_foul_tip')
+Foul = c('foul', 'foul_bunt')
+
+pitching_processed = pitching_processed |>
+  mutate(Swing = case_when(description %in% Swing ~ TRUE, TRUE ~ 0),
+         Whiff = case_when(description %in% Whiff ~ TRUE, TRUE ~ 0),
+         Foul = case_when(description %in% Foul ~ TRUE, TRUE ~ 0),
+         BIP = launch_speed_angle)
+
+```
+
+```{r}
+
+vprocessedData = pitching_processed |>
+  filter(PitchGroup == "Offspeed")
+
+modelData = vprocessedData |>
+  select(player_name, game_date, pitch_name,
+         release_speed, release_spin_rate, release_extension, release_pos_x,
+         release_pos_z, a_horz, a_vert, spin_axis, arm_angle, stand, p_throws, xVAA, xHAA,
+         RelSpeedDiff, Horz_Accel_Diff, Vert_Accel_Diff,
+         plate_x_og, plate_z_og,
+         Swing, Whiff, Foul, BIP)
+
+modelDataRightHand = modelData |>
+  filter(p_throws == "R") |>
+  rowid_to_column("ID") |>
+  select(-p_throws, -game_date, -pitch_name)
+
+modelDataLeftHand = modelData |>
+  filter(p_throws == "L") |>
+  rowid_to_column("ID") |>
+  select(-p_throws, -game_date, -pitch_name)
+
+```
+
+```{r}
+
+modelPrep = function(dataFrame, pitchType, outcomeType){
+  if (outcomeType == "Whiff"){
+    data = dataFrame |>
+      mutate(Label = as.factor(Whiff)) |>
+      select(-c(ID, Swing, Whiff, Foul, BIP, player_name))
+
+  } else if (outcomeType == "Foul"){
+    data = dataFrame |>
+      mutate(Label = as.factor(Foul)) |>
+      select(-c(ID, Swing, Whiff, Foul, BIP, player_name))
+
+  } else if (outcomeType == "BIP"){
+    data = dataFrame |>
+      filter(BIP != 0) |>
+      mutate(Label = as.factor(BIP - 1)) |>
+      select(-c(ID, Swing, Whiff, Foul, BIP, player_name))
+
+  } else {
+    print("Invalid Outcome Type: (Whiff, Foul, BIP)")
+    stop()
+  }
+}
+
+log_message <- function(msg, pitchType, outcomeType, pHand) {
+  log_path <- paste0(
+    "C:/Users/Mason/Desktop/Code/Baseball-Research/Stuff-Plus/2.0/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType,"_","log.txt"
+    )
+  con <- file(log_path, open = "a")  # 'a' means append mode
+  writeLines(paste0(Sys.time(), " - ", msg), con)
+  close(con)
+}
+
+trainStuffModels <- function(dataFrame, pitchType, outcomeType, pHand){
+
+  if (outcomeType %in% c('Whiff', 'Foul', 'BIP')){
+    set.seed(1015)
+
+    data_split = initial_validation_split(dataFrame, prop = c(0.8, 0.1), strata = Label)
+    train = training(data_split)
+    test = testing(data_split)
+    val_set = validation_set(data_split)
+    val = validation(data_split)
+
+    spec = boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), sample_size = tune()) %>%
+      set_mode("classification") %>%
+      set_engine("xgboost", nthread = 16)
+
+    rec = recipe(Label ~ ., data = train)
+
+    wf = workflow() %>%
+      add_model(spec) %>%
+      add_recipe(rec)
+
+    registerDoParallel(makeCluster(8))
+
+    log_message(paste0("Starting Tuning"), pitchType, outcomeType, pHand)
+    print(paste0("Starting Tuning: ", Sys.time()))
+
+    tune_res = wf %>%
+      tune_bayes(resamples = val_set,
+                 initial = 20,
+                 iter = 100,
+                 control = control_bayes(verbose = TRUE, no_improve = 5, seed = 1015),
+                 metrics = metric_set(roc_auc))
+
+    best_params = select_best(tune_res, metric = "roc_auc")
+
+    log_message(paste0("Starting Fitting"), pitchType, outcomeType, pHand)
+    print(paste0("Starting Fitting: ", Sys.time()))
+
+    final_model = wf %>%
+      finalize_workflow(best_params) %>%
+      fit(data = train)
+
+    log_message(paste0("Ended Fitting"), pitchType, outcomeType, pHand)
+    print(paste0("Ended Fitting: ", Sys.time()))
+
+    saveRDS(final_model, paste0(wd, "/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), ".rds"))
+
+    preds = predict(final_model, test, type = "prob") %>%
+      bind_cols(test)
+
+    if (outcomeType == "BIP") {
+      # Calculate Multiclass AUC
+      auc_res = roc_auc(data = preds, truth = Label,
+                        .pred_0, .pred_1, .pred_2, .pred_3, .pred_4, .pred_5,
+                        estimator = "hand_till")
+    } else {
+      # Calculate Binary AUC
+      auc_res = roc_auc(preds, Label, .pred_0)
+    }
+
+    write.csv(auc_res,
+              paste0(wd, "/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), "_Error.csv"),
+              row.names = FALSE)
+
+    vip_plot = final_model %>%
+      extract_fit_parsnip() %>%
+      vip(num_features = 40) +
+      ggtitle(paste0(pitchType, " - ", outcomeType, ":  Feature Importance"))
+
+    ggsave(filename = paste0(wd, "/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), "_VIP.png"),
+           plot = vip_plot, width = 10, height = 8, dpi = 300)
+
+    return(final_model)
+
+  } else {
+    log_message(paste0("Invalid Outcome Type: (Whiff, Foul, BIP)"), pitchType, outcomeType, pHand)
+    print("Invalid Outcome Type: (Whiff, Foul, BIP)")
+    stop()
+  }
+
+}
+
+```
+
+```{r}
+RHP_OS_Whiff_Data = modelPrep(modelDataRightHand, "OffSpeed_Quality", "Whiff")
+RHP_OS_Foul_Data = modelPrep(modelDataRightHand, "OffSpeed_Quality", "Foul")
+RHP_OS_BIP_Data = modelPrep(modelDataRightHand, "OffSpeed_Quality", "BIP")
+
+LHP_OS_Whiff_Data = modelPrep(modelDataLeftHand, "OffSpeed_Quality", "Whiff")
+LHP_OS_Foul_Data = modelPrep(modelDataLeftHand, "OffSpeed_Quality", "Foul")
+LHP_OS_BIP_Data = modelPrep(modelDataLeftHand, "OffSpeed_Quality", "BIP")
+```
+
+```{r}
+RHP_OS_Whiff_Model = trainStuffModels(RHP_OS_Whiff_Data, "OffSpeed_Quality", "Whiff", "RHP")
+RHP_OS_Foul_Model = trainStuffModels(RHP_OS_Foul_Data, "OffSpeed_Quality", "Foul", "RHP")
+RHP_OS_BIP_Model = trainStuffModels(RHP_OS_BIP_Data, "OffSpeed_Quality", "BIP", "RHP")
+
+LHP_OS_Whiff_Model = trainStuffModels(LHP_OS_Whiff_Data, "OffSpeed_Quality", "Whiff", "LHP")
+LHP_OS_Foul_Model = trainStuffModels(LHP_OS_Foul_Data, "OffSpeed_Quality", "Foul", "LHP")
+LHP_OS_BIP_Model = trainStuffModels(LHP_OS_BIP_Data, "OffSpeed_Quality", "BIP", "LHP")
+```
