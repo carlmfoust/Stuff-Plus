@@ -178,7 +178,9 @@ pitching_processed = pitching_processed |>
   mutate(Swing = case_when(description %in% Swing ~ TRUE, TRUE ~ 0),
          Whiff = case_when(description %in% Whiff ~ TRUE, TRUE ~ 0),
          Foul = case_when(description %in% Foul ~ TRUE, TRUE ~ 0),
-         BIP = launch_speed_angle)
+         BIP = launch_speed_angle,
+         CalledStrike = case_when(description == 'called_strike' ~ TRUE, TRUE ~ 0),
+         HBP = case_when(description == 'hit_by_pitch' ~ TRUE, TRUE ~ 0))
 
 ```
 
@@ -191,7 +193,7 @@ modelData = vprocessedData |>
   select(player_name, game_date, pitch_name,
          plate_x_og, plate_z_og,
          stand, p_throws,
-         Swing, Whiff, Foul, BIP)
+         Swing, Whiff, Foul, BIP, CalledStrike, HBP)
 
 modelDataRightHand = modelData |>
   filter(p_throws == "R") |>
@@ -211,21 +213,31 @@ modelPrep = function(dataFrame, pitchType, outcomeType){
   if (outcomeType == "Whiff"){
     data = dataFrame |>
       mutate(Label = as.factor(Whiff)) |>
-      select(-c(ID, Swing, Whiff, Foul, BIP, player_name))
+      select(-c(ID, Swing, Whiff, Foul, BIP, CalledStrike, HBP, player_name))
 
   } else if (outcomeType == "Foul"){
     data = dataFrame |>
       mutate(Label = as.factor(Foul)) |>
-      select(-c(ID, Swing, Whiff, Foul, BIP, player_name))
+      select(-c(ID, Swing, Whiff, Foul, BIP, CalledStrike, HBP, player_name))
 
   } else if (outcomeType == "BIP"){
     data = dataFrame |>
       filter(BIP != 0) |>
       mutate(Label = as.factor(BIP - 1)) |>
-      select(-c(ID, Swing, Whiff, Foul, BIP, player_name))
+      select(-c(ID, Swing, Whiff, Foul, BIP, CalledStrike, HBP, player_name))
+
+  } else if (outcomeType == "CalledStrike"){
+    data = dataFrame |>
+      mutate(Label = as.factor(CalledStrike)) |>
+      select(-c(ID, Swing, Whiff, Foul, BIP, CalledStrike, HBP, player_name))
+
+  } else if (outcomeType == "HBP"){
+    data = dataFrame |>
+      mutate(Label = as.factor(HBP)) |>
+      select(-c(ID, Swing, Whiff, Foul, BIP, CalledStrike, HBP, player_name))
 
   } else {
-    print("Invalid Outcome Type: (Whiff, Foul, BIP)")
+    print("Invalid Outcome Type: (Whiff, Foul, BIP, CalledStrike, HBP)")
     stop()
   }
 }
@@ -241,7 +253,7 @@ log_message <- function(msg, pitchType, outcomeType, pHand) {
 
 trainStuffModels <- function(dataFrame, pitchType, outcomeType, pHand){
 
-  if (outcomeType %in% c('Whiff', 'Foul', 'BIP')){
+  if (outcomeType %in% c('Whiff', 'Foul', 'BIP', 'CalledStrike', 'HBP')){
     set.seed(1015)
 
     data_split = initial_validation_split(dataFrame, prop = c(0.8, 0.1), strata = Label)
@@ -314,8 +326,8 @@ trainStuffModels <- function(dataFrame, pitchType, outcomeType, pHand){
     return(final_model)
 
   } else {
-    log_message(paste0("Invalid Outcome Type: (Whiff, Foul, BIP)"), pitchType, outcomeType, pHand)
-    print("Invalid Outcome Type: (Whiff, Foul, BIP)")
+    log_message(paste0("Invalid Outcome Type: (Whiff, Foul, BIP, CalledStrike, HBP)"), pitchType, outcomeType, pHand)
+    print("Invalid Outcome Type: (Whiff, Foul, BIP, CalledStrike, HBP)")
     stop()
   }
 
@@ -331,6 +343,12 @@ RHP_FF_BIP_Data = modelPrep(modelDataRightHand, "Fastball_Location", "BIP")
 LHP_FF_Whiff_Data = modelPrep(modelDataLeftHand, "Fastball_Location", "Whiff")
 LHP_FF_Foul_Data = modelPrep(modelDataLeftHand, "Fastball_Location", "Foul")
 LHP_FF_BIP_Data = modelPrep(modelDataLeftHand, "Fastball_Location", "BIP")
+
+RHP_FF_CalledStrike_Data = modelPrep(modelDataRightHand, "Fastball_Location", "CalledStrike")
+RHP_FF_HBP_Data = modelPrep(modelDataRightHand, "Fastball_Location", "HBP")
+
+LHP_FF_CalledStrike_Data = modelPrep(modelDataLeftHand, "Fastball_Location", "CalledStrike")
+LHP_FF_HBP_Data = modelPrep(modelDataLeftHand, "Fastball_Location", "HBP")
 ```
 
 ```{r}
@@ -341,4 +359,10 @@ RHP_FF_BIP_Model = trainStuffModels(RHP_FF_BIP_Data, "Fastball_Location", "BIP",
 LHP_FF_Whiff_Model = trainStuffModels(LHP_FF_Whiff_Data, "Fastball_Location", "Whiff", "LHP")
 LHP_FF_Foul_Model = trainStuffModels(LHP_FF_Foul_Data, "Fastball_Location", "Foul", "LHP")
 LHP_FF_BIP_Model = trainStuffModels(LHP_FF_BIP_Data, "Fastball_Location", "BIP", "LHP")
+
+RHP_FF_CalledStrike_Model = trainStuffModels(RHP_FF_CalledStrike_Data, "Fastball_Location", "CalledStrike", "RHP")
+RHP_FF_HBP_Model = trainStuffModels(RHP_FF_HBP_Data, "Fastball_Location", "HBP", "RHP")
+
+LHP_FF_CalledStrike_Model = trainStuffModels(LHP_FF_CalledStrike_Data, "Fastball_Location", "CalledStrike", "LHP")
+LHP_FF_HBP_Model = trainStuffModels(LHP_FF_HBP_Data, "Fastball_Location", "HBP", "LHP")
 ```
