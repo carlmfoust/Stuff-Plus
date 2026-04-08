@@ -22,6 +22,7 @@ library(tidyverse)
 library(tidymodels)
 library(xgboost)
 library(vip)
+library(shapviz)
 library(doParallel)
 
 # SQL
@@ -329,9 +330,20 @@ trainStuffModels <- function(dataFrame, pitchType, outcomeType, pHand){
       vip(num_features = 40) +
       ggtitle(paste0(pitchType, " - ", outcomeType, ":  Feature Importance"))
     
-    ggsave(filename = paste0(wd, "/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), "_VIP.png"), 
+    ggsave(filename = paste0(wd, "/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), "_VIP.png"),
            plot = vip_plot, width = 10, height = 8, dpi = 300)
-    
+
+    # SHAP Analysis
+    xgb_engine <- extract_fit_engine(final_model)
+    X_shap <- test |> select(-Label) |> as.matrix()
+    shap_obj <- shapviz(xgb_engine, X_pred = X_shap)
+
+    shap_plot <- sv_importance(shap_obj, kind = "beeswarm", max_display = 15) +
+      ggtitle(paste0(pitchType, " - ", outcomeType, " (", pHand, "): SHAP Feature Importance"))
+
+    ggsave(filename = paste0(wd, "/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), "_SHAP.png"),
+           plot = shap_plot, width = 10, height = 8, dpi = 300)
+
     return(final_model)
     
   } else {

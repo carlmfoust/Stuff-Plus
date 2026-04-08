@@ -1,0 +1,338 @@
+---
+title: "Player-Level SHAP Analysis"
+author: "Carl Foust"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Data Manipulation
+library(tidyverse)
+
+# Modeling
+library(tidymodels)
+library(xgboost)
+library(shapviz)
+
+# SQL
+library(RMySQL)
+
+wd <- getwd()
+set.seed(1015)
+```
+
+## Parameters
+
+Edit these values to select the player and model you want to analyze.
+
+```{r parameters}
+# --- USER CONFIG ---
+target_player <- "Gerrit Cole"   # player_name as it appears in Statcast data
+target_hand   <- "RHP"           # "RHP" or "LHP"
+pitch_type    <- "Fastball"      # "Fastball", "BreakingBall", "OffSpeed"
+outcome_type  <- "Whiff"         # "Whiff", "Foul", "BIP"
+model_dir     <- "../models"     # path to the directory containing saved RDS models
+
+# Path to approach angle models (used for xVAA / xHAA feature calculation)
+vaa_model_path <- file.path(model_dir, "VAA.rds")
+haa_model_path <- file.path(model_dir, "HAA.rds")
+
+# How many pitches to use for SHAP (NULL = all; set a number to sample for speed)
+shap_sample_n <- NULL
+
+# Output directory for saved plots
+output_dir <- file.path(wd, "output")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Load Approach Angle Models
+
+```{r load-angle-models}
+.VAA_Model <- readRDS(vaa_model_path)
+.HAA_Model <- readRDS(haa_model_path)
+```
+
+## Load & Preprocess Data
+
+Full feature engineering pipeline, identical to the primary model training scripts.
+Player name is retained throughout so we can filter after preprocessing.
+
+```{r load-data}
+con <- dbConnect(MySQL(),
+                 user = "root",
+                 host = "localhost",
+                 db   = "baseball-research")
+
+# Use all available data (train + test) for player-level analysis
+sql <- "SELECT * FROM statcast_pitching WHERE game_year >= 2021 AND game_type = 'R'"
+raw_data <- dbGetQuery(con, sql)
+dbDisconnect(con)
+```
+
+```{r feature-engineering}
+pitching_pbp <- raw_data |>
+  select(player_name, pitcher, pitch_name, at_bat_number,
+         pitch_number, description, launch_speed_angle, plate_x, plate_z,
+         release_speed, release_spin_rate, release_extension, spin_axis,
+         release_pos_x, release_pos_z, pfx_x, pfx_z,
+         p_throws, stand, game_year, game_date, vx0,
+         vy0, vz0, ax, ay, az, arm_angle) |>
+  drop_na(!launch_speed_angle)
+
+# Compute approach angles and acceleration components
+pitching_processed <- pitching_pbp |>
+  mutate(vy_f = -sqrt((vy0^2 - (2 * ay * (50 - (17/12))))),
+         t    = (vy_f - vy0) / ay,
+         vz_f = vz0 + (az * t),
+         vx_f = vx0 + (ax * t),
+         VAA  = -atan((vz_f / vy_f)) * (180 / pi),
+         HAA  = -atan((vx_f / vy_f)) * (180 / pi),
+         v_mag    = sqrt(vx0^2 + vy0^2 + vz0^2),
+         tang_x   = vx0 / v_mag,
+         tang_y   = vy0 / v_mag,
+         tang_z   = vz0 / v_mag,
+         handedness_factor = if_else(p_throws == "R", 1, -1),
+         temp_x = 0, temp_y = 0, temp_z = 1,
+         horz_x_raw = temp_y * tang_z - temp_z * tang_y,
+         horz_y_raw = temp_z * tang_x - temp_x * tang_z,
+         horz_z_raw = temp_x * tang_y - temp_y * tang_x,
+         horz_mag   = sqrt(horz_x_raw^2 + horz_y_raw^2 + horz_z_raw^2),
+         horz_x = horz_x_raw / horz_mag,
+         horz_y = horz_y_raw / horz_mag,
+         horz_z = horz_z_raw / horz_mag,
+         vert_x = tang_y * horz_z - tang_z * horz_y,
+         vert_y = tang_z * horz_x - tang_x * horz_z,
+         vert_z = tang_x * horz_y - tang_y * horz_x,
+         a_tang = ax * tang_x + ay * tang_y + az * tang_z,
+         a_horz = ax * horz_x + ay * horz_y + az * horz_z,
+         a_vert = ax * vert_x + ay * vert_y + az * vert_z) |>
+  select(-c(vx0:az, vy_f:vx_f, v_mag:a_tang))
+
+pitching_processed <- pitching_processed |>
+  mutate(pfx_x      = pfx_x * 12,
+         pfx_z      = pfx_z * 12,
+         stand      = as.numeric(factor(stand)) - 1,
+         plate_x_og = plate_x,
+         plate_z_og = plate_z,
+         plate_x    = 0,
+         plate_z    = 2.5)
+
+# Pitch group classification
+pitching_processed <- pitching_processed |>
+  mutate(PitchGroup = case_when(
+    pitch_name %in% c("4-Seam Fastball", "Sinker", "Cutter")                          ~ "Fastball",
+    pitch_name %in% c("Slider", "Sweeper", "Curveball", "Slurve",
+                      "Knuckle Curve", "Slow Curve", "Screwball")                      ~ "BreakingBall",
+    pitch_name %in% c("Changeup", "Split-Finger", "Forkball")                         ~ "Offspeed",
+    pitch_name %in% c("Eephus", "Knuckleball", "Other")                               ~ "Other",
+    TRUE ~ NA
+  ))
+
+# xVAA / xHAA predictions
+VAA_preds <- predict(.VAA_Model, pitching_processed) |> rename(xVAA = .pred)
+HAA_preds <- predict(.HAA_Model, pitching_processed) |> rename(xHAA = .pred)
+
+pitching_processed <- bind_cols(pitching_processed, VAA_preds, HAA_preds) |>
+  select(player_name:pitch_name, PitchGroup, at_bat_number:stand,
+         arm_angle:VAA, xVAA, HAA, xHAA, a_horz:plate_z_og, game_date, game_year)
+
+# Fastball averages for relative features
+FB_avg <- pitching_processed |>
+  filter(pitch_name %in% c("4-Seam Fastball", "Sinker")) |>
+  group_by(player_name, pitcher) |>
+  summarise(n       = n(),
+            FBvelo  = mean(release_speed, na.rm = TRUE),
+            FBvbreak = mean(pfx_z, na.rm = TRUE),
+            FBhbreak = mean(pfx_x, na.rm = TRUE),
+            .groups = "drop")
+
+# Cutter reclassification
+Cutter_data <- pitching_processed |>
+  filter(pitch_name == "Cutter") |>
+  group_by(player_name, pitcher) |>
+  summarise(n = n(), CTvelo = mean(release_speed, na.rm = TRUE),
+            CTvert = mean(pfx_z, na.rm = TRUE), .groups = "drop")
+
+Cutter_labeled <- Cutter_data |>
+  left_join(FB_avg, by = c("player_name", "pitcher")) |>
+  mutate(VeloRatio  = CTvelo / FBvelo,
+         pitch_name = "Cutter",
+         new_group  = case_when(
+           is.na(FBvelo) & CTvert > 5  ~ "Fastball",
+           is.na(FBvelo)               ~ "BreakingBall",
+           VeloRatio >= 0.95           ~ "Fastball",
+           CTvert <= 5                 ~ "BreakingBall",
+           VeloRatio <= 0.935          ~ "BreakingBall",
+           TRUE                        ~ "Fastball"
+         )) |>
+  select(player_name, pitcher, pitch_name, new_group)
+
+pitching_processed <- pitching_processed |>
+  left_join(Cutter_labeled, by = c("player_name", "pitcher", "pitch_name")) |>
+  mutate(PitchGroup = if_else(pitch_name == "Cutter", new_group, PitchGroup)) |>
+  select(-new_group)
+
+# Relative features
+pitching_processed <- pitching_processed |>
+  left_join(FB_avg |> select(-n), by = c("player_name", "pitcher")) |>
+  mutate(RelSpeedDiff    = release_speed - FBvelo,
+         Horz_Accel_Diff = a_horz - FBhbreak,
+         Vert_Accel_Diff = a_vert - FBvbreak,
+         launch_speed_angle = ifelse(is.na(launch_speed_angle), 0, launch_speed_angle)) |>
+  na.omit()
+
+# Target variables
+Swing_desc <- c("hit_into_play", "foul", "foul_tip", "swinging_strike",
+                "swinging_strike_blocked", "foul_bunt", "missed_bunt", "bunt_foul_tip")
+Whiff_desc <- c("swinging_strike", "swinging_strike_blocked", "foul_tip", "bunt_foul_tip")
+Foul_desc  <- c("foul", "foul_bunt")
+
+pitching_processed <- pitching_processed |>
+  mutate(Swing = case_when(description %in% Swing_desc ~ TRUE, TRUE ~ 0),
+         Whiff = case_when(description %in% Whiff_desc ~ TRUE, TRUE ~ 0),
+         Foul  = case_when(description %in% Foul_desc  ~ TRUE, TRUE ~ 0),
+         BIP   = launch_speed_angle)
+```
+
+## Load Model
+
+```{r load-model}
+model_files <- list.files(
+  path    = file.path(model_dir, target_hand, outcome_type),
+  pattern = paste0("^", pitch_type, "_.*\\.rds$"),
+  full.names = TRUE
+)
+
+if (length(model_files) == 0) {
+  stop("No model found for: ", target_hand, " / ", pitch_type, " / ", outcome_type,
+       "\nLooked in: ", file.path(model_dir, target_hand, outcome_type))
+}
+
+model_path  <- model_files[which.max(file.mtime(model_files))]
+final_model <- readRDS(model_path)
+message("Loaded model: ", basename(model_path))
+```
+
+## Prepare Player Data
+
+```{r player-data}
+feature_cols <- c("release_speed", "release_spin_rate", "release_extension",
+                  "release_pos_x", "release_pos_z", "a_horz", "a_vert",
+                  "spin_axis", "arm_angle", "stand", "xVAA", "xHAA")
+
+p_throws_val <- if_else(target_hand == "RHP", "R", "L")
+
+player_data <- pitching_processed |>
+  filter(player_name == target_player,
+         p_throws    == p_throws_val,
+         PitchGroup  == pitch_type)
+
+if (outcome_type == "BIP") {
+  player_data <- player_data |> filter(BIP != 0)
+}
+
+if (nrow(player_data) == 0) {
+  stop("No pitches found for player: ", target_player,
+       " (", target_hand, " | ", pitch_type, ")")
+}
+
+# Optional: sample for speed
+if (!is.null(shap_sample_n) && nrow(player_data) > shap_sample_n) {
+  set.seed(1015)
+  player_data <- player_data |> slice_sample(n = shap_sample_n)
+}
+
+X_player <- player_data |> select(all_of(feature_cols)) |> as.matrix()
+
+message(nrow(X_player), " pitches for ", target_player)
+```
+
+## Compute SHAP Values
+
+```{r shap-compute}
+xgb_engine <- extract_fit_engine(final_model)
+shap_obj   <- shapviz(xgb_engine, X_pred = X_player)
+```
+
+## SHAP Plots
+
+### Feature Importance — Beeswarm
+
+Each dot is one pitch. Color indicates the feature value (red = high, blue = low).
+Horizontal position shows the SHAP value — how much that feature pushed the prediction
+up (right) or down (left).
+
+```{r shap-beeswarm, fig.width=10, fig.height=7}
+p_beeswarm <- sv_importance(shap_obj, kind = "beeswarm", max_display = 12) +
+  labs(title = paste0(target_player, "  |  ", pitch_type, " ", outcome_type),
+       subtitle = paste0("SHAP Feature Importance  (n = ", nrow(X_player), " pitches)"))
+
+p_beeswarm
+
+ggsave(filename = file.path(output_dir,
+         paste0(gsub(" ", "_", target_player), "_", target_hand, "_",
+                pitch_type, "_", outcome_type, "_SHAP_beeswarm.png")),
+       plot = p_beeswarm, width = 10, height = 7, dpi = 300)
+```
+
+### Feature Importance — Bar (Mean |SHAP|)
+
+Average absolute SHAP value per feature — a simple ranking of overall influence.
+
+```{r shap-bar, fig.width=9, fig.height=6}
+p_bar <- sv_importance(shap_obj, kind = "bar", max_display = 12) +
+  labs(title = paste0(target_player, "  |  ", pitch_type, " ", outcome_type),
+       subtitle = "Mean |SHAP| — Average feature influence across all pitches")
+
+p_bar
+
+ggsave(filename = file.path(output_dir,
+         paste0(gsub(" ", "_", target_player), "_", target_hand, "_",
+                pitch_type, "_", outcome_type, "_SHAP_bar.png")),
+       plot = p_bar, width = 9, height = 6, dpi = 300)
+```
+
+### Waterfall — Single Pitch Breakdown
+
+Shows how each feature moves the prediction from the baseline (expected value) to the
+final predicted probability for one specific pitch. Change `row_id` to inspect different pitches.
+
+```{r shap-waterfall, fig.width=10, fig.height=7}
+# row_id = 1 is the first pitch in the filtered set; change as desired
+waterfall_row <- 1
+
+pitch_meta <- player_data |>
+  slice(waterfall_row) |>
+  select(game_date, pitch_name)
+
+p_waterfall <- sv_waterfall(shap_obj, row_id = waterfall_row) +
+  labs(title = paste0(target_player, "  |  Single Pitch SHAP Breakdown"),
+       subtitle = paste0(pitch_meta$pitch_name, "  —  ", pitch_meta$game_date))
+
+p_waterfall
+
+ggsave(filename = file.path(output_dir,
+         paste0(gsub(" ", "_", target_player), "_", target_hand, "_",
+                pitch_type, "_", outcome_type, "_SHAP_waterfall_pitch", waterfall_row, ".png")),
+       plot = p_waterfall, width = 10, height = 7, dpi = 300)
+```
+
+### Waterfall — Average Across All Pitches
+
+A single "typical pitch" view: the mean SHAP values across all of the player's pitches,
+showing which features systematically push their prediction up or down.
+
+```{r shap-waterfall-mean, fig.width=10, fig.height=7}
+p_waterfall_mean <- sv_waterfall(shap_obj, row_id = 1:nrow(X_player)) +
+  labs(title = paste0(target_player, "  |  Mean SHAP Breakdown"),
+       subtitle = paste0("Averaged across all ", nrow(X_player), " ", pitch_type, " pitches"))
+
+p_waterfall_mean
+
+ggsave(filename = file.path(output_dir,
+         paste0(gsub(" ", "_", target_player), "_", target_hand, "_",
+                pitch_type, "_", outcome_type, "_SHAP_waterfall_mean.png")),
+       plot = p_waterfall_mean, width = 10, height = 7, dpi = 300)
+```
