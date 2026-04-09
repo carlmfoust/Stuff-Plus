@@ -20,204 +20,183 @@ library(tidymodels)
 library(xgboost)
 library(vip)
 library(doParallel)
+library(probably)
 
 # SQL
-library(RMySQL)
+library(RPostgres)
+
+# Load Functions
+source("../utils.R")
 
 wd <- getwd()
 set.seed(1015)
 ```
 
 ```{r}
-.vaa_model = readRDS(paste0("C:/Users/Mason/Desktop/Code/Baseball-Research/Stuff-Plus/2.0/models/VAA.rds"))
-
-.haa_model = readRDS(paste0("C:/Users/Mason/Desktop/Code/Baseball-Research/Stuff-Plus/2.0/models/HAA.rds"))
+.vaa_model = load_model_xgb("exp_vaa_XGBoost_2025-12-24_12-28.json")
+.haa_model = load_model_xgb("exp_haa_XGBoost_2025-12-24_14-31.json")
+.arm_angle_model = load_model_xgb("exp_arm_angle_XGBoost_2025-12-24_16-43.json")
+.exp_ff_avert_model = load_model_xgb("exp_ff_az_XGBoost_2026-01-06_00-04.json")
+.exp_ff_ahorz_model = load_model_xgb("exp_ff_ahorz_XGBoost_2026-01-19_21-30.json")
+.exp_si_avert_model = load_model_xgb("exp_si_avert_XGBoost_2026-02-16_23-34.json")
+.exp_si_ahorz_model = load_model_xgb("exp_si_ahorz_XGBoost_2026-02-17_00-02.json")
+.exp_ct_avert_model = load_model_xgb("exp_ct_avert_XGBoost_2026-02-16_22-01.json")
+.exp_ct_ahorz_model = load_model_xgb("exp_ct_ahorz_XGBoost_2026-02-16_22-34.json")
 ```
 
 ```{r}
-con <- dbConnect(MySQL(),
-                 user="root",
-                 host="localhost",
+con <- dbConnect(Postgres(), 
+                 user = "postgres", 
+                 host = "localhost", 
                  db = "baseball-research")
 
-training_sql <- "SELECT * FROM statcast_pitching WHERE game_year >= 2021 AND game_year < 2025 AND game_type = 'R'"
+training_sql <- "SELECT * FROM statcast_pitching_dev WHERE game_year >= 2022 AND game_type = 'R'"
 
-testing_sql <- "SELECT * FROM statcast_pitching WHERE game_year >= 2025 AND game_type = 'R'"
+# testing_sql <- "SELECT * FROM statcast_pitching_dev WHERE game_year >= 2025 AND game_type = 'R'"
 
 data_train <- dbGetQuery(con, training_sql)
-data_test <- dbGetQuery(con, testing_sql) |> filter(game_year > 2024)
+# data_test <- dbGetQuery(con, testing_sql) |> filter(game_year > 2024)
 
 ```
 
-```{r}
+```{r data-processing}
+processed_data_train <- create_advance_metrics(data_train)
 
-pitching_pbp <- data_train |> 
-  select(player_name, pitcher, pitch_name, at_bat_number, 
-         pitch_number, description, launch_speed_angle, plate_x, plate_z, 
-         release_speed, release_spin_rate, release_extension, spin_axis, release_pos_x, release_pos_z, pfx_x, pfx_z, 
-         p_throws, stand, game_year, game_date, vx0, 
-         vy0, vz0, ax, ay, az, arm_angle) |> 
-  drop_na(!launch_speed_angle)
-
-pitching_processed <- pitching_pbp |> 
-  mutate(vy_f = -sqrt((vy0^2 - (2 * ay * (50 - (17/12))))),
-         t = (vy_f - vy0) / ay,
-         vz_f = vz0 + (az * t),
-         vx_f = vx0 + (ax * t),
-         VAA = -atan((vz_f / vy_f)) * (180 / pi),
-         HAA = -atan((vx_f / vy_f)) * (180 / pi),
-         v_mag = sqrt(vx0^2 + vy0^2 + vz0^2),
-         tang_x = vx0 / v_mag,
-         tang_y = vy0 / v_mag,
-         tang_z = vz0 / v_mag,
-         handedness_factor = if_else(p_throws == "R", 1, -1),
-         temp_x = 0,
-         temp_y = 0,
-         temp_z = 1,
-         horz_x_raw = temp_y * tang_z - temp_z * tang_y,
-         horz_y_raw = temp_z * tang_x - temp_x * tang_z,
-         horz_z_raw = temp_x * tang_y - temp_y * tang_x,
-         horz_mag = sqrt(horz_x_raw^2 + horz_y_raw^2 + horz_z_raw^2),
-         horz_x = horz_x_raw / horz_mag,
-         horz_y = horz_y_raw / horz_mag,
-         horz_z = horz_z_raw / horz_mag,
-         vert_x = tang_y * horz_z - tang_z * horz_y,
-         vert_y = tang_z * horz_x - tang_x * horz_z,
-         vert_z = tang_x * horz_y - tang_y * horz_x,
-         a_tang = ax * tang_x + ay * tang_y + az * tang_z,
-         a_horz = ax * horz_x + ay * horz_y + az * horz_z,
-         a_vert = ax * vert_x + ay * vert_y + az * vert_z) |> 
-  select(-c(vx0:az, vy_f:vx_f, v_mag:a_tang))
-
-pitching_processed <- pitching_processed |> 
-  mutate(pfx_x = pfx_x * 12,
-         pfx_z = pfx_z * 12,
-         stand = as.numeric(factor(stand)) - 1,
-         plate_x_og = plate_x,
-         plate_z_og = plate_z,
-         plate_x = 0,
-         plate_z = 2.5)
-
-pitching_processed <- pitching_processed |>
-  mutate(PitchGroup = case_when(pitch_name %in% c("4-Seam Fastball", "Sinker", "Cutter") ~ "Fastball",
-                                pitch_name %in% c("Slider", "Sweeper", "Curveball", "Slurve",
-                                                  "Knuckle Curve", "Slow Curve", "Screwball") ~ "BreakingBall",
-                                pitch_name %in% c("Changeup", "Split-Finger", "Forkball") ~ "Offspeed",
-                                pitch_name %in% c("Eephus", "Knuckleball", "Other") ~ "Other",
-                                TRUE ~ NA))
-
-VAA_preds = predict(.VAA_Model, pitching_processed) |> rename(xVAA = .pred)
-
-HAA_preds = predict(.HAA_Model, pitching_processed) |> rename(xHAA = .pred)
-
-pitching_processed = bind_cols(pitching_processed, VAA_preds, HAA_preds) |>
-  select(player_name:pitch_name, PitchGroup, at_bat_number:stand, arm_angle:VAA, xVAA, HAA, xHAA, a_horz:plate_z_og, game_date, game_year)
+# processed_data_test <- create_advance_metrics(data_test)
 ```
 
-```{r}
+```{r data-processing}
+vaa_preds <- generate_model_preds(model = .vaa_model,
+                                  data = processed_data_train,
+                                  features = vaa_features,
+                                  output_name = "xVAA")
 
-FB_avg <- pitching_processed |> 
-  filter(pitch_name %in% c("4-Seam Fastball", "Sinker")) |> 
-  group_by(player_name, pitcher) |> 
-  summarise(
-    n = n(),
-    FBvelo = mean(release_speed, na.rm = TRUE),
-    FBvbreak = mean(pfx_z, na.rm = TRUE),
-    FBhbreak = mean(pfx_x, na.rm = TRUE),
-    .groups = "drop"
-  )
+haa_preds <- generate_model_preds(model = .haa_model,
+                                  data = processed_data_train,
+                                  features = haa_features,
+                                  output_name = "xHAA")
 
-# Step 2: Cutter data
-Cutter_data <- pitching_processed |> 
-  filter(pitch_name == "Cutter") |> 
-  group_by(player_name, pitcher) |> 
-  summarise(
-    n = n(),
-    CTvelo = mean(release_speed, na.rm = TRUE),
-    CTvert = mean(pfx_z, na.rm = TRUE),
-    .groups = "drop"
-  )
+arm_angle_preds <- generate_model_preds(model = .arm_angle_model,
+                                        data = processed_data_train,
+                                        features = arm_angle_features,
+                                        output_name = "exp_arm_angle")
 
-# Step 3: Join and Compare
-Cutter_labeled <- Cutter_data |> 
-  left_join(FB_avg, by = c("player_name", "pitcher")) |> 
-  mutate(
-    VeloRatio = CTvelo / FBvelo,
-    pitch_name = "Cutter",
-    new_group = case_when(
-      is.na(FBvelo) & CTvert > 5 ~ "Fastball",
-      is.na(FBvelo) ~ "BreakingBall",
-      VeloRatio >= 0.95 ~ "Fastball",
-      CTvert <= 5 ~ "BreakingBall",
-      VeloRatio <= 0.935 ~ "BreakingBall",
-      TRUE ~ "Fastball"
-    )
-  ) |> select(player_name, pitcher, pitch_name, new_group)
+exp_ff_avert_preds <- generate_model_preds(model = .exp_ff_avert_model,
+                                        data = processed_data_train,
+                                        features = exp_ff_features,
+                                        output_name = "exp_ff_avert")
 
-# Step 4: Combine with rest of data
-pitching_processed <- pitching_processed |> 
-  left_join(Cutter_labeled, by = c("player_name", "pitcher", "pitch_name")) |> 
-  mutate(PitchGroup = if_else(pitch_name == "Cutter", new_group, PitchGroup)) |> 
-  select(-new_group)
+exp_ff_ahorz_preds <- generate_model_preds(model = .exp_ff_ahorz_model,
+                                           data = processed_data_train,
+                                           features = exp_ff_x_features,
+                                           output_name = "exp_ff_ahorz")
 
-pitching_processed <- pitching_processed |> 
-  left_join(FB_avg |> select(-c(n)), by = c('player_name', 'pitcher')) |> 
-  mutate(RelSpeedDiff = release_speed - FBvelo,
-         Horz_Accel_Diff = a_horz - FBhbreak,
-         Vert_Accel_Diff = a_vert - FBvbreak,
-         launch_speed_angle = ifelse(is.na(launch_speed_angle), 0, launch_speed_angle)) |> 
-  na.omit()
+exp_si_avert_preds <- generate_model_preds(model = .exp_si_avert_model,
+                                        data = processed_data_train,
+                                        features = exp_ff_features,
+                                        output_name = "exp_si_avert")
 
-```
+exp_si_ahorz_preds <- generate_model_preds(model = .exp_si_ahorz_model,
+                                           data = processed_data_train,
+                                           features = exp_ff_x_features,
+                                           output_name = "exp_si_ahorz")
 
-```{r}
+exp_ct_avert_preds <- generate_model_preds(model = .exp_ct_avert_model,
+                                        data = processed_data_train,
+                                        features = exp_ff_features,
+                                        output_name = "exp_ct_avert")
 
-Swing = c('hit_into_play', 'foul','foul_tip', 'swinging_strike', 'swinging_strike_blocked',
-          'foul_bunt', 'missed_bunt', 'bunt_foul_tip')
-Whiff = c('swinging_strike', 'swinging_strike_blocked', 'foul_tip', 'bunt_foul_tip')
-Foul = c('foul', 'foul_bunt')
-#BIP = c('hit_into_play')
+exp_ct_ahorz_preds <- generate_model_preds(model = .exp_ct_ahorz_model,
+                                           data = processed_data_train,
+                                           features = exp_ff_x_features,
+                                           output_name = "exp_ct_ahorz")
 
-pitching_processed = pitching_processed |> 
-  mutate(Swing = case_when(description %in% Swing ~ TRUE, TRUE ~ 0),
-         Whiff = case_when(description %in% Whiff ~ TRUE, TRUE ~ 0),
-         Foul = case_when(description %in% Foul ~ TRUE, TRUE ~ 0),
+processed_data_train <- bind_cols(processed_data_train, 
+                                  vaa_preds, 
+                                  haa_preds, 
+                                  arm_angle_preds, 
+                                  exp_ff_avert_preds,
+                                  exp_ff_ahorz_preds,
+                                  exp_si_avert_preds,
+                                  exp_si_ahorz_preds,
+                                  exp_ct_avert_preds,
+                                  exp_ct_ahorz_preds)
+
+pitching_processed <- processed_data_train |> 
+  mutate(arm_angle_savant = arm_angle,
+         arm_angle = ifelse(is.na(arm_angle), exp_arm_angle, arm_angle)) |> 
+  mutate(swing = case_when(description %in% swing_list ~ TRUE, TRUE ~ 0),
+         whiff = case_when(description %in% whiff_list ~ TRUE, TRUE ~ 0),
+         foul = case_when(description %in% foul_list ~ TRUE, TRUE ~ 0),
          #BIP = case_when(description %in% BIP ~ TRUE, TRUE ~ 0)
-         BIP = launch_speed_angle)
+         bip = launch_speed_angle) %>% 
+  mutate(exp_ahorz = case_when(pitch_name == "4-Seam Fastball" ~ exp_ff_ahorz,
+                               pitch_name == "Sinker" ~ exp_si_ahorz,
+                               pitch_name == "Cutter" ~ exp_ct_ahorz,
+                               TRUE ~ NA_real_),
+         exp_avert = case_when(pitch_name == "4-Seam Fastball" ~ exp_ff_avert,
+                               pitch_name == "Sinker" ~ exp_si_avert,
+                               pitch_name == "Cutter" ~ exp_ct_avert,
+                               TRUE ~ NA_real_),
+         diff_exp_ahorz = a_horz - exp_ahorz,
+         diff_exp_avert = a_vert - exp_avert)
+```
+
+```{r}
+# hhh=pitching_processed %>% select(pitcher:pitch_group, a_horz, a_vert, xVAA:diff_exp_avert) %>% filter(pitch_group == "Fastball") %>% group_by(pitcher, pitch_name) %>% summarise(n=n(), ahorz = round(mean(a_horz), 1), avert = round(mean(a_vert), 1), exp_ff_ahorz = round(mean(exp_ff_ahorz),1), exp_ff_avert = round(mean(exp_ff_avert),1), exp_si_ahorz = round(mean(exp_si_ahorz),1), exp_si_avert = round(mean(exp_si_avert),1), exp_ct_ahorz = round(mean(exp_ct_ahorz),1), exp_ct_avert = round(mean(exp_ct_avert),1))
+# 
+# library(baseballr)
+# all_players_2025 <- mlb_sports_players(sport_id = 1, season = 2025) %>% 
+#   select(player_id, full_name)
+# 
+# hhhh=hhh %>% rename(player_id = pitcher) %>% left_join(all_players_2025) %>% select(player_id, full_name, pitch_name:exp_ct_avert)
+
+
+# data_typed <- pitching_processed |> 
+#   left_join(Cutter_labeled, by = c("pitcher", "pitch_name", "game_year")) |> 
+#   mutate(pitch_group = if_else(pitch_name == "Cutter", new_group, pitch_group)) |> 
+#   select(-new_group)
+# 
+# data_typed <- data_typed |> 
+#   left_join(FB_avg |> select(-c(n)), by = c('pitcher', "game_year")) |> 
+#   mutate(RelSpeedDiff = release_speed - FBvelo,
+#          Horz_Accel_Diff = a_horz - FBhbreak,
+#          Vert_Accel_Diff = a_vert - FBvbreak,
+#          launch_speed_angle = ifelse(is.na(launch_speed_angle), 0, launch_speed_angle))
 
 ```
 
 ```{r}
 
-processedData = pitching_processed |> 
-  filter(PitchGroup == "Fastball",
-         Swing == 1)
+processed_data = pitching_processed |> 
+  filter(pitch_group == "Fastball",
+         swing == 1)
 
-vprocessedData = pitching_processed |> 
-  filter(PitchGroup == "Fastball")
+# vprocessedData = pitching_processed |> 
+#   filter(PitchGroup == "Fastball")
 
-modelData = vprocessedData |> 
-  select(player_name, game_date, pitch_name, release_speed, release_spin_rate, release_extension, release_pos_x, 
-         release_pos_z, a_horz, a_vert, spin_axis, arm_angle, stand, p_throws, xVAA, xHAA, 
-         #RelSpeedDiff, Horz_Accel_Diff, Vert_Accel_Diff, 
-         Swing, Whiff, Foul, BIP)# |> 
-  #mutate(BIP_Weak = ifelse(launch_speed_angle == 1, 1, 0),
-  #       BIP_Topped = ifelse(launch_speed_angle == 2, 1, 0),
-  #       BIP_Under = ifelse(launch_speed_angle == 3, 1, 0),
-  #       BIP_FlareBurner = ifelse(launch_speed_angle == 4, 1, 0),
-  #       BIP_Solid = ifelse(launch_speed_angle == 5, 1, 0),
-  #       BIP_Barrel = ifelse(launch_speed_angle == 6, 1, 0)) |> 
-  #select(-launch_speed_angle)
+model_data = processed_data |> 
+  select(pitcher, game_date, pitch_name, is_lhh, p_throws,
+         release_speed, release_spin_rate, release_extension, release_pos_x, release_pos_z, 
+         a_vert, diff_exp_avert, a_horz, diff_exp_ahorz,
+         spin_axis, arm_angle, xVAA, xHAA, 
+         # rel_speed_fb_diff, a_horz_fb_diff, a_vert_fb_diff,
+         # exp_ff_ax, exp_ff_avert, 
+         swing, whiff, foul, bip)
 
-modelDataRightHand = modelData |> 
-  filter(p_throws == "R") |> 
+model_data_rhp = model_data |> 
+  filter(p_throws == 1) |> 
   rowid_to_column("ID") |> 
-  select(-p_throws, -game_date, -pitch_name)
+  select(-c(p_throws, game_date, pitch_name, pitcher))
 
-modelDataLeftHand = modelData |> 
-  filter(p_throws == "L") |> 
+model_data_lhp = model_data |> 
+  filter(p_throws == 0) |> 
   rowid_to_column("ID") |> 
-  select(-p_throws, -game_date, -pitch_name)
+  select(-c(p_throws, game_date, pitch_name, pitcher))
+
+```
+
+```{r}
 
 ```
 
@@ -227,20 +206,20 @@ modelPrep = function(dataFrame, pitchType, outcomeType){
   if (outcomeType == "Whiff"){
     data = dataFrame |> 
       #filter(Swing == 1) |> 
-      mutate(Label = as.factor(Whiff)) |> 
-      select(-c(ID, Swing, Whiff, Foul, BIP, player_name))
+      mutate(label = as.factor(whiff)) |> 
+      select(-c(ID, swing, whiff, foul, bip))
     
   } else if (outcomeType == "Foul"){
     data = dataFrame |> 
       #filter(Whiff == 0) |> 
-      mutate(Label = as.factor(Foul)) |> 
-      select(-c(ID, Swing, Whiff, Foul, BIP, player_name))
+      mutate(label = as.factor(foul)) |> 
+      select(-c(ID, swing, whiff, foul, bip))
     
   } else if (outcomeType == "BIP"){
     data = dataFrame |> 
-      filter(BIP != 0) |> 
-      mutate(Label = as.factor(BIP - 1)) |> 
-      select(-c(ID, Swing, Whiff, Foul, BIP, player_name))
+      filter(bip != 0) |> 
+      mutate(label = as.factor(bip - 1)) |> 
+      select(-c(ID, swing, whiff, foul, bip))
     
   } else {
     print("Invalid Outcome Type: (Whiff, Foul, BIP)")
@@ -248,118 +227,23 @@ modelPrep = function(dataFrame, pitchType, outcomeType){
   }
 }
 
-log_message <- function(msg, pitchType, outcomeType, pHand) {
-  log_path <- paste0(
-    "C:/Users/Mason/Desktop/Code/Baseball-Research/Stuff-Plus/2.0/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType,"_","log.txt"
-    )
-  con <- file(log_path, open = "a")  # 'a' means append mode
-  writeLines(paste0(Sys.time(), " - ", msg), con)
-  close(con)
-}
-
-trainStuffModels <- function(dataFrame, pitchType, outcomeType, pHand){
-  
-  if (outcomeType %in% c('Whiff', 'Foul', 'BIP')){
-    set.seed(1015)
-    
-    data_split = initial_validation_split(dataFrame, prop = c(0.8, 0.1), strata = Label)
-    train = training(data_split)
-    test = testing(data_split)
-    val_set = validation_set(data_split)
-    val = validation(data_split)
-    
-    spec = boost_tree(trees = tune(), min_n = tune(), tree_depth = tune(), learn_rate = tune(), sample_size = tune()) %>%
-      set_mode("classification") %>%
-      set_engine("xgboost", nthread = 16)
-    
-    rec = recipe(Label ~ ., data = train)
-    
-    wf = workflow() %>%
-      add_model(spec) %>%
-      add_recipe(rec)
-    
-    registerDoParallel(makeCluster(8))
-    
-    log_message(paste0("Starting Tuning"), pitchType, outcomeType, pHand)
-    print(paste0("Starting Tuning: ", Sys.time()))
-    
-    tune_res = wf %>%
-      tune_bayes(resamples = val_set,
-                 initial = 20,
-                 iter = 100,
-                 control = control_bayes(verbose = TRUE, no_improve = 5, seed = 1015),
-                 metrics = metric_set(roc_auc))
-    
-    best_params = select_best(tune_res, metric = "roc_auc")
-    
-    log_message(paste0("Starting Fitting"), pitchType, outcomeType, pHand)
-    print(paste0("Starting Fitting: ", Sys.time()))
-    
-    final_model = wf %>%
-      finalize_workflow(best_params) %>%
-      fit(data = train)
-    
-    log_message(paste0("Ended Fitting"), pitchType, outcomeType, pHand)
-    print(paste0("Ended Fitting: ", Sys.time()))
-    
-    saveRDS(final_model, paste0(wd, "/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), ".rds"))
-    
-    preds = predict(final_model, test, type = "prob") %>%
-      bind_cols(test)
-    
-    if (outcomeType == "BIP") {
-      # Calculate Multiclass AUC
-      auc_res = roc_auc(data = preds, truth = Label,
-                        .pred_0, .pred_1, .pred_2, .pred_3, .pred_4, .pred_5,
-                        estimator = "hand_till")
-    } else {
-      # Calculate Binary AUC
-      auc_res = roc_auc(preds, Label, .pred_0)
-    }
-    
-    write.csv(auc_res, 
-              paste0(wd, "/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), "_Error.csv"), 
-              row.names = FALSE)
-    
-    vip_plot = final_model %>%
-      extract_fit_parsnip() %>%
-      vip(num_features = 40) +
-      ggtitle(paste0(pitchType, " - ", outcomeType, ":  Feature Importance"))
-    
-    ggsave(filename = paste0(wd, "/models/", pHand, "/", outcomeType, "/", pitchType, "_", outcomeType, "_", Sys.Date(), "_", format(Sys.time(), "%H-%M"), "_VIP.png"), 
-           plot = vip_plot, width = 10, height = 8, dpi = 300)
-    
-    return(final_model)
-    
-  } else {
-    log_message(paste0("Invalid Outcome Type: (Whiff, Foul, BIP)"), pitchType, outcomeType, pHand)
-    print("Invalid Outcome Type: (Whiff, Foul, BIP)")
-    stop()
-  }
-  
-}
-
 ```
 
 ```{r}
-RHP_FF_Whiff_Data = modelPrep(modelDataRightHand, "Fastball", "Whiff")
-RHP_FF_Foul_Data = modelPrep(modelDataRightHand, "Fastball", "Foul")
-RHP_FF_BIP_Data = modelPrep(modelDataRightHand, "Fastball", "BIP")
+RHP_FF_Whiff_Data = modelPrep(model_data_rhp, "Fastball", "Whiff")
+RHP_FF_Foul_Data = modelPrep(model_data_rhp, "Fastball", "Foul")
+RHP_FF_BIP_Data = modelPrep(model_data_rhp, "Fastball", "BIP")
 
-LHP_FF_Whiff_Data = modelPrep(modelDataLeftHand, "Fastball", "Whiff")
-LHP_FF_Foul_Data = modelPrep(modelDataLeftHand, "Fastball", "Foul")
-LHP_FF_BIP_Data = modelPrep(modelDataLeftHand, "Fastball", "BIP")
+LHP_FF_Whiff_Data = modelPrep(model_data_lhp, "Fastball", "Whiff")
+LHP_FF_Foul_Data = modelPrep(model_data_lhp, "Fastball", "Foul")
+LHP_FF_BIP_Data = modelPrep(model_data_lhp, "Fastball", "BIP")
 
-# write.csv(RHP_FF_Whiff_Data, paste0(wd, "/RHP_FF_Whiff_Data", ".csv"))
-```
+train_classification_model(RHP_FF_Whiff_Data, "rhp_ff_whiff", tune_no_improve = 25)
+train_classification_model(RHP_FF_Foul_Data, "rhp_ff_foul", tune_no_improve = 25)
+train_multi_classification_model(RHP_FF_BIP_Data, "rhp_ff_bip", tune_no_improve = 25)
 
-```{r}
-RHP_FF_Whiff_Model = trainStuffModels(RHP_FF_Whiff_Data, "Fastball", "Whiff", "RHP")
-RHP_FF_Foul_Model = trainStuffModels(RHP_FF_Foul_Data, "Fastball", "Foul", "RHP")
-RHP_FF_BIP_Model = trainStuffModels(RHP_FF_BIP_Data, "Fastball", "BIP", "RHP")
-
-LHP_FF_Whiff_Model = trainStuffModels(LHP_FF_Whiff_Data, "Fastball", "Whiff", "LHP")
-LHP_FF_Foul_Model = trainStuffModels(LHP_FF_Foul_Data, "Fastball", "Foul", "LHP")
-LHP_FF_BIP_Model = trainStuffModels(LHP_FF_BIP_Data, "Fastball", "BIP", "LHP")
+train_classification_model(LHP_FF_Whiff_Data, "lhp_ff_whiff", tune_no_improve = 25)
+train_classification_model(LHP_FF_Foul_Data, "lhp_ff_foul", tune_no_improve = 25)
+train_multi_classification_model(LHP_FF_BIP_Data, "lhp_ff_bip", tune_no_improve = 25)
 ```
 
