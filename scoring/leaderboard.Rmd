@@ -1,0 +1,424 @@
+---
+title: "Pitch Metrics Leaderboard — 2025"
+author: "Carl Foust"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(xgboost)
+library(RPostgres)
+library(DT)
+library(knitr)
+
+source("../utils.R")
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+set.seed(1015)
+
+MODELS_DIR <- "~/Code/Stuff-Plus/models/"
+MIN_PITCHES <- 200   # minimum pitches to appear on leaderboard
+
+# Linear run value weights
+RV_WHIFF <- -0.25   # swinging strike
+RV_FOUL  <- -0.07   # foul ball
+RV_CS    <- -0.12   # called strike
+RV_HBP   <-  0.37   # hit by pitch
+# BIP run values by launch speed-angle category (classes 0–5):
+# 0=Weak, 1=Topped, 2=Under, 3=Flare/Burner, 4=Solid, 5=Barrel
+RV_BIP   <- c(-0.14, -0.09, -0.03, 0.09, 0.15, 0.28)
+```
+
+```{r helpers}
+# Find and load the most-recently-trained RDS workflow for a given model name
+load_model <- function(name, dir = MODELS_DIR) {
+  pattern <- paste0("^", name, "_XGBoost_.*\\.rds$")
+  files   <- list.files(dir, pattern = pattern, full.names = TRUE)
+  if (length(files) == 0) {
+    warning(paste0("Model not found: ", name))
+    return(NULL)
+  }
+  readRDS(files[order(file.mtime(files), decreasing = TRUE)][1])
+}
+
+# Binary prediction → P(positive class)
+pred_binary <- function(model, data, features) {
+  if (is.null(model) || nrow(data) == 0) return(rep(NA_real_, nrow(data)))
+  tryCatch(
+    predict(model, data |> select(all_of(features)), type = "prob")$.pred_1,
+    error = function(e) { warning(e$message); rep(NA_real_, nrow(data)) }
+  )
+}
+
+# Multiclass BIP prediction → expected run value (dot product with RV_BIP)
+pred_bip_rv <- function(model, data, features) {
+  if (is.null(model) || nrow(data) == 0) return(rep(NA_real_, nrow(data)))
+  tryCatch({
+    probs <- predict(model, data |> select(all_of(features)), type = "prob")
+    as.numeric(as.matrix(probs) %*% RV_BIP)
+  }, error = function(e) { warning(e$message); rep(NA_real_, nrow(data)) })
+}
+
+# Scale a per-pitcher average RV to a Plus metric (100 = league avg, higher = better)
+to_plus <- function(pitcher_rv) {
+  league_mean <- mean(pitcher_rv, na.rm = TRUE)
+  league_sd   <- sd(pitcher_rv,   na.rm = TRUE)
+  round(100 + (league_mean - pitcher_rv) / league_sd * 15, 1)
+}
+```
+
+```{r feature-definitions}
+# Feature sets mirror the training modelPrep column selections exactly
+FF_STUFF <- c("is_lhh", "release_speed", "release_spin_rate", "release_extension",
+              "release_pos_x", "release_pos_z", "a_vert", "diff_exp_avert",
+              "a_horz", "diff_exp_ahorz", "spin_axis", "arm_angle", "xVAA", "xHAA")
+
+BB_STUFF <- c("is_lhh", "release_speed", "release_spin_rate", "release_extension",
+              "release_pos_x", "release_pos_z", "a_vert", "a_horz",
+              "spin_axis", "arm_angle", "xVAA", "xHAA",
+              "rel_speed_fb_diff", "a_horz_fb_diff", "a_vert_fb_diff")
+
+OS_STUFF <- c("is_lhh", "release_speed", "release_spin_rate", "release_extension",
+              "release_pos_x", "release_pos_z", "a_vert", "a_horz",
+              "spin_axis", "arm_angle",
+              "rel_speed_fb_diff", "a_horz_fb_diff", "a_vert_fb_diff")
+
+LOC_FEAT  <- c("is_lhh", "plate_x", "plate_z", "sz_top", "sz_bot", "dist_from_mid")
+
+FF_QUAL   <- c(FF_STUFF, "plate_x", "plate_z", "sz_top", "sz_bot", "dist_from_mid")
+BB_QUAL   <- c(BB_STUFF, "plate_x", "plate_z", "sz_top", "sz_bot", "dist_from_mid")
+OS_QUAL   <- c(OS_STUFF, "plate_x", "plate_z", "sz_top", "sz_bot", "dist_from_mid")
+```
+
+---
+
+## Model Loading
+
+```{r load-secondary-models}
+# Secondary models used to generate input features for Stuff+ and Quality+
+.vaa_model        <- load_model_xgb("exp_vaa_XGBoost_2025-12-24_12-28.json")
+.haa_model        <- load_model_xgb("exp_haa_XGBoost_2025-12-24_14-31.json")
+.arm_angle_model  <- load_model_xgb("exp_arm_angle_XGBoost_2025-12-24_16-43.json")
+.exp_ff_avert_model  <- load_model_xgb("exp_ff_az_XGBoost_2026-01-06_00-04.json")
+.exp_ff_ahorz_model  <- load_model_xgb("exp_ff_ahorz_XGBoost_2026-01-19_21-30.json")
+.exp_si_avert_model  <- load_model_xgb("exp_si_avert_XGBoost_2026-02-16_23-34.json")
+.exp_si_ahorz_model  <- load_model_xgb("exp_si_ahorz_XGBoost_2026-02-17_00-02.json")
+.exp_ct_avert_model  <- load_model_xgb("exp_ct_avert_XGBoost_2026-02-16_22-01.json")
+.exp_ct_ahorz_model  <- load_model_xgb("exp_ct_ahorz_XGBoost_2026-02-16_22-34.json")
+```
+
+```{r load-stuff-models}
+stuff_models <- list(
+  ff = list(
+    rhp = list(whiff = load_model("rhp_ff_whiff"), foul = load_model("rhp_ff_foul"), bip = load_model("rhp_ff_bip")),
+    lhp = list(whiff = load_model("lhp_ff_whiff"), foul = load_model("lhp_ff_foul"), bip = load_model("lhp_ff_bip"))
+  ),
+  bb = list(
+    rhp = list(whiff = load_model("rhp_bb_whiff"), foul = load_model("rhp_bb_foul"), bip = load_model("rhp_bb_bip")),
+    lhp = list(whiff = load_model("lhp_bb_whiff"), foul = load_model("lhp_bb_foul"), bip = load_model("lhp_bb_bip"))
+  ),
+  os = list(
+    rhp = list(whiff = load_model("rhp_os_whiff"), foul = load_model("rhp_os_foul"), bip = load_model("rhp_os_bip")),
+    lhp = list(whiff = load_model("lhp_os_whiff"), foul = load_model("lhp_os_foul"), bip = load_model("lhp_os_bip"))
+  )
+)
+```
+
+```{r load-location-models}
+loc_models <- list(
+  ff = list(
+    rhp = list(whiff = load_model("rhp_ff_loc_whiff"), foul = load_model("rhp_ff_loc_foul"),
+               bip   = load_model("rhp_ff_loc_bip"),   cs   = load_model("rhp_ff_loc_cs"),
+               hbp   = load_model("rhp_ff_loc_hbp")),
+    lhp = list(whiff = load_model("lhp_ff_loc_whiff"), foul = load_model("lhp_ff_loc_foul"),
+               bip   = load_model("lhp_ff_loc_bip"),   cs   = load_model("lhp_ff_loc_cs"),
+               hbp   = load_model("lhp_ff_loc_hbp"))
+  ),
+  bb = list(
+    rhp = list(whiff = load_model("rhp_bb_loc_whiff"), foul = load_model("rhp_bb_loc_foul"),
+               bip   = load_model("rhp_bb_loc_bip"),   cs   = load_model("rhp_bb_loc_cs"),
+               hbp   = load_model("rhp_bb_loc_hbp")),
+    lhp = list(whiff = load_model("lhp_bb_loc_whiff"), foul = load_model("lhp_bb_loc_foul"),
+               bip   = load_model("lhp_bb_loc_bip"),   cs   = load_model("lhp_bb_loc_cs"),
+               hbp   = load_model("lhp_bb_loc_hbp"))
+  ),
+  os = list(
+    rhp = list(whiff = load_model("rhp_os_loc_whiff"), foul = load_model("rhp_os_loc_foul"),
+               bip   = load_model("rhp_os_loc_bip"),   cs   = load_model("rhp_os_loc_cs"),
+               hbp   = load_model("rhp_os_loc_hbp")),
+    lhp = list(whiff = load_model("lhp_os_loc_whiff"), foul = load_model("lhp_os_loc_foul"),
+               bip   = load_model("lhp_os_loc_bip"),   cs   = load_model("lhp_os_loc_cs"),
+               hbp   = load_model("lhp_os_loc_hbp"))
+  )
+)
+```
+
+```{r load-quality-models}
+qual_models <- list(
+  ff = list(
+    rhp = list(whiff = load_model("rhp_ff_qual_whiff"), foul = load_model("rhp_ff_qual_foul"),
+               bip   = load_model("rhp_ff_qual_bip"),   cs   = load_model("rhp_ff_qual_cs"),
+               hbp   = load_model("rhp_ff_qual_hbp")),
+    lhp = list(whiff = load_model("lhp_ff_qual_whiff"), foul = load_model("lhp_ff_qual_foul"),
+               bip   = load_model("lhp_ff_qual_bip"),   cs   = load_model("lhp_ff_qual_cs"),
+               hbp   = load_model("lhp_ff_qual_hbp"))
+  ),
+  bb = list(
+    rhp = list(whiff = load_model("rhp_bb_qual_whiff"), foul = load_model("rhp_bb_qual_foul"),
+               bip   = load_model("rhp_bb_qual_bip"),   cs   = load_model("rhp_bb_qual_cs"),
+               hbp   = load_model("rhp_bb_qual_hbp")),
+    lhp = list(whiff = load_model("lhp_bb_qual_whiff"), foul = load_model("lhp_bb_qual_foul"),
+               bip   = load_model("lhp_bb_qual_bip"),   cs   = load_model("lhp_bb_qual_cs"),
+               hbp   = load_model("lhp_bb_qual_hbp"))
+  ),
+  os = list(
+    rhp = list(whiff = load_model("rhp_os_qual_whiff"), foul = load_model("rhp_os_qual_foul"),
+               bip   = load_model("rhp_os_qual_bip"),   cs   = load_model("rhp_os_qual_cs"),
+               hbp   = load_model("rhp_os_qual_hbp")),
+    lhp = list(whiff = load_model("lhp_os_qual_whiff"), foul = load_model("lhp_os_qual_foul"),
+               bip   = load_model("lhp_os_qual_bip"),   cs   = load_model("lhp_os_qual_cs"),
+               hbp   = load_model("lhp_os_qual_hbp"))
+  )
+)
+```
+
+---
+
+## Data Preparation
+
+```{r db-pull}
+con <- dbConnect(Postgres(),
+                 user = "postgres",
+                 host = "localhost",
+                 db   = "baseball-research")
+
+sql_2025 <- "SELECT * FROM statcast_pitching_dev WHERE game_year = 2025 AND game_type = 'R'"
+data_2025 <- dbGetQuery(con, sql_2025)
+dbDisconnect(con)
+```
+
+```{r process-data}
+processed <- create_advance_metrics(data_2025)
+```
+
+```{r secondary-preds}
+vaa_preds          <- generate_model_preds(.vaa_model,       processed, vaa_features,       "xVAA")
+haa_preds          <- generate_model_preds(.haa_model,       processed, haa_features,       "xHAA")
+arm_angle_preds    <- generate_model_preds(.arm_angle_model,  processed, arm_angle_features, "exp_arm_angle")
+exp_ff_avert_preds <- generate_model_preds(.exp_ff_avert_model, processed, exp_ff_features,   "exp_ff_avert")
+exp_ff_ahorz_preds <- generate_model_preds(.exp_ff_ahorz_model, processed, exp_ff_x_features, "exp_ff_ahorz")
+exp_si_avert_preds <- generate_model_preds(.exp_si_avert_model, processed, exp_ff_features,   "exp_si_avert")
+exp_si_ahorz_preds <- generate_model_preds(.exp_si_ahorz_model, processed, exp_ff_x_features, "exp_si_ahorz")
+exp_ct_avert_preds <- generate_model_preds(.exp_ct_avert_model, processed, exp_ff_features,   "exp_ct_avert")
+exp_ct_ahorz_preds <- generate_model_preds(.exp_ct_ahorz_model, processed, exp_ff_x_features, "exp_ct_ahorz")
+
+pitching <- bind_cols(
+  processed,
+  vaa_preds, haa_preds, arm_angle_preds,
+  exp_ff_avert_preds, exp_ff_ahorz_preds,
+  exp_si_avert_preds, exp_si_ahorz_preds,
+  exp_ct_avert_preds, exp_ct_ahorz_preds
+) |>
+  mutate(
+    arm_angle = ifelse(is.na(arm_angle), exp_arm_angle, arm_angle),
+    # Fastball-specific expected acceleration and deviation columns
+    exp_ahorz = case_when(pitch_name == "4-Seam Fastball" ~ exp_ff_ahorz,
+                          pitch_name == "Sinker"          ~ exp_si_ahorz,
+                          pitch_name == "Cutter"          ~ exp_ct_ahorz,
+                          TRUE ~ NA_real_),
+    exp_avert = case_when(pitch_name == "4-Seam Fastball" ~ exp_ff_avert,
+                          pitch_name == "Sinker"          ~ exp_si_avert,
+                          pitch_name == "Cutter"          ~ exp_ct_avert,
+                          TRUE ~ NA_real_),
+    diff_exp_ahorz = a_horz - exp_ahorz,
+    diff_exp_avert = a_vert - exp_avert
+  )
+```
+
+---
+
+## Generating Predictions
+
+```{r predict-function}
+# Predict all three metrics for one pitch group × handedness slice
+predict_slice <- function(data_slice, hand_models_stuff, hand_models_loc, hand_models_qual,
+                          feat_stuff, feat_loc, feat_qual) {
+  if (nrow(data_slice) == 0) return(NULL)
+
+  # Stuff+ run value (swing-conditional quality)
+  rv_stuff <- pred_binary(hand_models_stuff$whiff, data_slice, feat_stuff) * RV_WHIFF +
+              pred_binary(hand_models_stuff$foul,  data_slice, feat_stuff) * RV_FOUL  +
+              pred_bip_rv(hand_models_stuff$bip,   data_slice, feat_stuff)
+
+  # Location+ run value
+  rv_loc_swing <- pred_binary(hand_models_loc$whiff, data_slice, feat_loc) * RV_WHIFF +
+                  pred_binary(hand_models_loc$foul,  data_slice, feat_loc) * RV_FOUL  +
+                  pred_bip_rv(hand_models_loc$bip,   data_slice, feat_loc)
+  rv_loc_all   <- pred_binary(hand_models_loc$cs,  data_slice, feat_loc) * RV_CS  +
+                  pred_binary(hand_models_loc$hbp,  data_slice, feat_loc) * RV_HBP
+  rv_loc       <- rv_loc_swing + rv_loc_all
+
+  # Quality+ run value
+  rv_qual_swing <- pred_binary(hand_models_qual$whiff, data_slice, feat_qual) * RV_WHIFF +
+                   pred_binary(hand_models_qual$foul,  data_slice, feat_qual) * RV_FOUL  +
+                   pred_bip_rv(hand_models_qual$bip,   data_slice, feat_qual)
+  rv_qual_all   <- pred_binary(hand_models_qual$cs,  data_slice, feat_qual) * RV_CS  +
+                   pred_binary(hand_models_qual$hbp,  data_slice, feat_qual) * RV_HBP
+  rv_qual       <- rv_qual_swing + rv_qual_all
+
+  data_slice |>
+    select(pitcher, pitch_name, pitch_group, p_throws, game_date) |>
+    mutate(rv_stuff = rv_stuff, rv_loc = rv_loc, rv_qual = rv_qual)
+}
+```
+
+```{r run-predictions}
+groups <- list(
+  list(group = "Fastball",    key = "ff", feat_stuff = FF_STUFF, feat_qual = FF_QUAL),
+  list(group = "BreakingBall",key = "bb", feat_stuff = BB_STUFF, feat_qual = BB_QUAL),
+  list(group = "Offspeed",    key = "os", feat_stuff = OS_STUFF, feat_qual = OS_QUAL)
+)
+
+all_preds <- map_dfr(groups, function(g) {
+  d <- pitching |> filter(pitch_group == g$group)
+
+  bind_rows(
+    predict_slice(d |> filter(p_throws == 1),
+                  stuff_models[[g$key]]$rhp, loc_models[[g$key]]$rhp, qual_models[[g$key]]$rhp,
+                  g$feat_stuff, LOC_FEAT, g$feat_qual),
+    predict_slice(d |> filter(p_throws == 0),
+                  stuff_models[[g$key]]$lhp, loc_models[[g$key]]$lhp, qual_models[[g$key]]$lhp,
+                  g$feat_stuff, LOC_FEAT, g$feat_qual)
+  )
+})
+```
+
+---
+
+## Leaderboard
+
+```{r build-leaderboard}
+# Join player names
+player_names <- data_2025 |>
+  distinct(pitcher, player_name)
+
+leaderboard_raw <- all_preds |>
+  group_by(pitcher, pitch_group) |>
+  summarise(
+    n         = n(),
+    rv_stuff  = mean(rv_stuff, na.rm = TRUE),
+    rv_loc    = mean(rv_loc,   na.rm = TRUE),
+    rv_qual   = mean(rv_qual,  na.rm = TRUE),
+    .groups   = "drop"
+  ) |>
+  filter(n >= MIN_PITCHES) |>
+  left_join(player_names, by = "pitcher")
+
+# Overall (all pitch types combined)
+leaderboard_overall <- all_preds |>
+  group_by(pitcher) |>
+  summarise(
+    n         = n(),
+    rv_stuff  = mean(rv_stuff, na.rm = TRUE),
+    rv_loc    = mean(rv_loc,   na.rm = TRUE),
+    rv_qual   = mean(rv_qual,  na.rm = TRUE),
+    .groups   = "drop"
+  ) |>
+  filter(n >= MIN_PITCHES) |>
+  left_join(player_names, by = "pitcher") |>
+  mutate(
+    stuff_plus    = to_plus(rv_stuff),
+    location_plus = to_plus(rv_loc),
+    quality_plus  = to_plus(rv_qual)
+  ) |>
+  arrange(desc(stuff_plus)) |>
+  select(player_name, n, stuff_plus, location_plus, quality_plus)
+
+# Per-group leaderboards
+make_group_leaderboard <- function(df, group_name) {
+  df |>
+    filter(pitch_group == group_name) |>
+    mutate(
+      stuff_plus    = to_plus(rv_stuff),
+      location_plus = to_plus(rv_loc),
+      quality_plus  = to_plus(rv_qual)
+    ) |>
+    arrange(desc(stuff_plus)) |>
+    select(player_name, n, stuff_plus, location_plus, quality_plus)
+}
+
+lb_ff <- make_group_leaderboard(leaderboard_raw, "Fastball")
+lb_bb <- make_group_leaderboard(leaderboard_raw, "BreakingBall")
+lb_os <- make_group_leaderboard(leaderboard_raw, "Offspeed")
+```
+
+### Overall (All Pitches)
+
+```{r table-overall}
+datatable(
+  leaderboard_overall |> rename(Pitcher = player_name, Pitches = n,
+                                 `Stuff+` = stuff_plus, `Location+` = location_plus,
+                                 `Quality+` = quality_plus),
+  options  = list(pageLength = 25, order = list(list(2, "desc"))),
+  rownames = FALSE
+) |>
+  formatRound(columns = c("Stuff+", "Location+", "Quality+"), digits = 1)
+```
+
+### Fastballs
+
+```{r table-ff}
+datatable(
+  lb_ff |> rename(Pitcher = player_name, Pitches = n,
+                   `Stuff+` = stuff_plus, `Location+` = location_plus,
+                   `Quality+` = quality_plus),
+  options  = list(pageLength = 25, order = list(list(2, "desc"))),
+  rownames = FALSE
+) |>
+  formatRound(columns = c("Stuff+", "Location+", "Quality+"), digits = 1)
+```
+
+### Breaking Balls
+
+```{r table-bb}
+datatable(
+  lb_bb |> rename(Pitcher = player_name, Pitches = n,
+                   `Stuff+` = stuff_plus, `Location+` = location_plus,
+                   `Quality+` = quality_plus),
+  options  = list(pageLength = 25, order = list(list(2, "desc"))),
+  rownames = FALSE
+) |>
+  formatRound(columns = c("Stuff+", "Location+", "Quality+"), digits = 1)
+```
+
+### Off-Speed
+
+```{r table-os}
+datatable(
+  lb_os |> rename(Pitcher = player_name, Pitches = n,
+                   `Stuff+` = stuff_plus, `Location+` = location_plus,
+                   `Quality+` = quality_plus),
+  options  = list(pageLength = 25, order = list(list(2, "desc"))),
+  rownames = FALSE
+) |>
+  formatRound(columns = c("Stuff+", "Location+", "Quality+"), digits = 1)
+```
+
+---
+
+## Metric Definitions
+
+| Metric | What it measures | Features used |
+|---|---|---|
+| **Stuff+** | Expected swing-outcome quality based on pitch physical characteristics | Velocity, movement, spin, approach angles |
+| **Location+** | Expected outcome quality based purely on pitch placement and batter strike zone | Plate coordinates, strike zone dimensions |
+| **Quality+** | Combined expected outcome quality (stuff + location) | All Stuff+ features plus plate coordinates |
+
+**Scaling:** 100 = league average, 115 ≈ 1 SD above average (better for pitcher), 85 ≈ 1 SD below. All metrics include Whiff, Foul, BIP quality (swing-conditional), Called Strike, and HBP.
