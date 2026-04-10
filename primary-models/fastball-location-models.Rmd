@@ -32,7 +32,7 @@ con <- dbConnect(Postgres(),
                  host = "localhost",
                  db = "baseball-research")
 
-training_sql <- "SELECT * FROM statcast_pitching_dev WHERE game_year >= 2022 AND game_type = 'R'"
+training_sql <- "SELECT * FROM statcast_pitching_dev WHERE game_year >= 2022 AND game_year <= 2025 AND game_type = 'R'"
 
 data_train <- dbGetQuery(con, training_sql)
 ```
@@ -119,6 +119,11 @@ modelPrep = function(dataFrame, outcomeType){
       mutate(label = as.factor(hbp)) |>
       select(-c(ID, swing, whiff, foul, bip, called_strike, hbp))
 
+  } else if (outcomeType == "Swing"){
+    data = dataFrame |>
+      mutate(label = as.factor(swing)) |>
+      select(-c(ID, swing, whiff, foul, bip, called_strike, hbp))
+
   } else {
     print("Invalid Outcome Type: (Whiff, Foul, BIP, CalledStrike, HBP)")
     stop()
@@ -137,9 +142,11 @@ LHP_FF_BIP_Data = modelPrep(model_data_swing_lhp, "BIP")
 
 RHP_FF_CS_Data = modelPrep(model_data_all_rhp, "CalledStrike")
 RHP_FF_HBP_Data = modelPrep(model_data_all_rhp, "HBP")
+RHP_FF_Swing_Data = modelPrep(model_data_all_rhp, "Swing")
 
 LHP_FF_CS_Data = modelPrep(model_data_all_lhp, "CalledStrike")
 LHP_FF_HBP_Data = modelPrep(model_data_all_lhp, "HBP")
+LHP_FF_Swing_Data = modelPrep(model_data_all_lhp, "Swing")
 ```
 
 ```{r}
@@ -156,4 +163,7 @@ train_classification_model(RHP_FF_HBP_Data, "rhp_ff_loc_hbp", tune_no_improve = 
 
 train_classification_model(LHP_FF_CS_Data, "lhp_ff_loc_cs", tune_no_improve = 25)
 train_classification_model(LHP_FF_HBP_Data, "lhp_ff_loc_hbp", tune_no_improve = 25)
+
+train_classification_model(RHP_FF_Swing_Data, "rhp_ff_loc_swing", tune_no_improve = 25)
+train_classification_model(LHP_FF_Swing_Data, "lhp_ff_loc_swing", tune_no_improve = 25)
 ```

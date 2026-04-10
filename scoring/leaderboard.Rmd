@@ -19,6 +19,7 @@ library(DT)
 library(knitr)
 
 source("../utils.R")
+source("data_prep.R")
 
 knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
 set.seed(1015)
