@@ -3,3 +3,6 @@
 /.Rproj.user
 Tacklebox.Rproj
 /models
+__pycache__/
+*.pyc
+primary-models/python/models/
